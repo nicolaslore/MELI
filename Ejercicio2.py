@@ -2,6 +2,7 @@ import os
 import argparse
 import requests
 import json
+from operator import itemgetter
 from datetime import datetime
 
 #Set Environment Config
@@ -69,31 +70,38 @@ def get_token_f(token_api_url, payload_token_api_url, log_file):
         raise NameError(f"Error al obtener TOKEN.")
 
 
-#Calcular retraso de entrega en HH:mm:ss
-def calculate_delay_f(estimated_delivery, delivery):
+#Convertir a datetime
+def convert_to_datetime_f(date_str):
     #Ejemplo de formato: 2022-02-24T16:39:17.017-04:00
-    estimated_delivery_date = estimated_delivery[0:10]
-    estimated_delivery_time = estimated_delivery[11:19]
-    estimated_delivery_time_ms = estimated_delivery[20:23]
-    estimated_delivery_date_tz = estimated_delivery[23:29]
-    estimated_delivery_datetime = datetime.fromisoformat(f"{estimated_delivery_date} {estimated_delivery_time}:{estimated_delivery_time_ms}{estimated_delivery_date_tz}")
+    date = date_str[0:10]
+    time = date_str[11:19]
+    time_ms = date_str[20:23]
+    date_tz = date_str[23:29]
+    return datetime.fromisoformat(f"{date} {time}:{time_ms}{date_tz}")
 
-    delivery_date = delivery[0:10]
-    delivery_time = delivery[11:19]
-    delivery_time_ms = delivery[20:23]
-    delivery_date_tz = delivery[23:29]
-    delivery_datetime = datetime.fromisoformat(f"{delivery_date} {delivery_time}:{delivery_time_ms}{delivery_date_tz}")
 
-    delivery_delay = delivery_datetime - estimated_delivery_datetime
-
-    total_seconds = delivery_delay.total_seconds()
-
-    hours = int(total_seconds/3600)
-    minutes = int((total_seconds - hours*3600)/60)
-    seconds = int(total_seconds - hours*3600 - minutes*60)
-    delay = f"{hours}:{minutes}:{seconds}"
+#Calcular delta entre fechas con formato HH:mm:ss
+def calculate_delta_f(d1, d2, in_seconds):
     
-    return delay
+    d1_datetime = convert_to_datetime_f(d1)
+    d2_datetime = convert_to_datetime_f(d2)
+
+    delta_time = d2_datetime - d1_datetime
+
+    total_seconds = delta_time.total_seconds()
+
+    if in_seconds:
+        if total_seconds <= 0:
+            return 1 #Entrega en mismo día
+        else:
+            return total_seconds
+    else:
+        hours = int(total_seconds/3600)
+        minutes = int((total_seconds - hours*3600)/60)
+        seconds = int(total_seconds - hours*3600 - minutes*60)
+        delta = f"{str(hours). zfill(2)}:{str(minutes). zfill(2)}:{str(seconds). zfill(2)}"
+        
+        return delta
 
 
 #Build Report Line
@@ -121,6 +129,8 @@ def build_report_line_f(shipment, shipment_api_response_dic, shipments_history_a
     delivery_delay = "null"
     delivery_result = "null"
     shipment_status = shipments_history_api_response_dic["status"]
+    shipment_creation = "null"
+    efficiency = 0
 
     if "estimated_delivery_time" in shipment_api_response_dic["shipping_option"]:
         estimated_delivery_time = shipment_api_response_dic["shipping_option"]["estimated_delivery_time"]["date"]
@@ -130,34 +140,51 @@ def build_report_line_f(shipment, shipment_api_response_dic, shipments_history_a
         estimated_delivery_final = shipment_api_response_dic["shipping_option"]["estimated_delivery_final"]["date"]
     
 
+    if "date_history" in shipments_history_api_response_dic:
+        shipment_creation = shipments_history_api_response_dic["date_history"]["date_created"]
+    
+
     if history_status_code != 200:
         delivery_date = "No pudo obtenerse"
     else:
         if shipment_status == "delivered":
             delivery_date = shipments_history_api_response_dic["date_history"]["date_delivered"]
             if estimated_delivery_time:
+                efficiency = 1000000/calculate_delta_f(shipment_creation, estimated_delivery_time, True)
                 if datetime.strptime(delivery_date[0:10],"%Y-%m-%d") <= datetime.strptime(estimated_delivery_time[0:10],"%Y-%m-%d"):
                         delivery_result = "En tiempo y forma"
                 else:
                     delivery_result = "Con retraso"
-                    delivery_delay = calculate_delay_f(estimated_delivery_time, delivery_date)
+                    delivery_delay = calculate_delta_f(estimated_delivery_time, delivery_date, False)
         
             else:
                 if estimated_delivery_final:
+                    efficiency = 1000000/calculate_delta_f(shipment_creation, estimated_delivery_final, True)
                     if datetime.strptime(delivery_date[0:10],"%Y-%m-%d") <= datetime.strptime(estimated_delivery_final[0:10],"%Y-%m-%d"):
                         delivery_result = "En tiempo y forma"
                     else:
                         delivery_result = "Con retraso"
-                        delivery_delay = calculate_delay_f(estimated_delivery_final, delivery_date)
+                        delivery_delay = calculate_delta_f(estimated_delivery_final, delivery_date, False)
                     
                 else:
                     delivery_result = "No puede calcularse"
         else:            
             delivery_date = "No entregado aún"
 
-
+    
     #Armo registro de archivo csv
-    line = f"{shipment}|{shipment_status}|{logistics}|{origin}|{delivery_date}|{estimated_delivery_time}|{estimated_delivery_final}|{delivery_result}|{delivery_delay}"
+    line = []
+    line.append(shipment)
+    line.append(shipment_status)
+    line.append(logistics)
+    line.append(origin)
+    line.append(delivery_date)
+    line.append(estimated_delivery_time)
+    line.append(estimated_delivery_final)
+    line.append(delivery_result)
+    line.append(delivery_delay)
+    line.append(efficiency)
+    #line = f"{shipment}|{shipment_status}|{logistics}|{origin}|{delivery_date}|{estimated_delivery_time}|{estimated_delivery_final}|{delivery_result}|{delivery_delay}|{efficiency}\n"
 
     return line
 
@@ -166,11 +193,12 @@ def build_report_line_f(shipment, shipment_api_response_dic, shipments_history_a
 def process_shipments_f(shipments_list, token, shipments_api_url, history_api_url, date, log_file, is_prod):
         api_token = {"Authorization": f"Bearer {token}"}
         output_path = os.environ.get('PY_REPORT_PATH')
+        report_lines = []
 
         try:
             #Open report file
             shipment_report_file = open_file_f(output_path, "py2_shipment_report", date, "csv")
-            shipment_report_file.write("NRO_ENVIO|ESTADO|LOGISTICA|ORIGEN|DIA_ENTREGA|PROMESA_ENTREGA|FECHA_FINAL|RESULTADO_ENTREGA|RETRASO\n")
+            shipment_report_file.write("NRO_ENVIO|ESTADO|LOGISTICA|ORIGEN|DIA_ENTREGA|PROMESA_ENTREGA|FECHA_FINAL|RESULTADO_ENTREGA|RETRASO|EFICIENCIA\n")
             
             for shipment in shipments_list:
 
@@ -194,12 +222,19 @@ def process_shipments_f(shipments_list, token, shipments_api_url, history_api_ur
 
                     #Build Shipment Report line
                     log_f(True, f"Starting record construction for Shipment: {shipment}...", log_file)
-                    report_line = build_report_line_f(shipment, json.loads(shipments_api_response.text), json.loads(shipments_history_api_response.text), shipments_history_api_response.status_code)
-                    log_f(True, "Writting record to file...", log_file)
-                    shipment_report_file.write(f"{report_line}\n")
+                    report_lines.append(build_report_line_f(shipment, json.loads(shipments_api_response.text), json.loads(shipments_history_api_response.text), shipments_history_api_response.status_code))
+                    log_f(True, "Writing record to buffer...", log_file)
 
                 else:
                     log_f(True, f"Falla en la integración de SHIPMENT API [GET]. El servidor respondió con Status Code: {shipments_api_response.status_code}", log_file)
+                
+            log_f(True, "Sorting lines by efficiency...", log_file)
+            report_lines.sort(key=itemgetter(9), reverse=True)
+            log_f(True, "Writing lines to file...", log_file)
+            for report_line in report_lines:
+                str_converted_report_line = [str(element) for element in report_line] #Paso a lista temporal los elementos convirtiéndolos a string
+                report_line_str = "|".join(str_converted_report_line) #Convierto el listado de elementos en string separado por pipe
+                shipment_report_file.write(f"{report_line_str}\n")
 
         except Exception as e:
             log_f(True, e, log_file)
